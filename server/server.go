@@ -44,7 +44,14 @@ type Server struct {
 	ctx    context.Context
 
 	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	jwtKey   []byte // HS256 signing key; swapped in place when a password change rotates it
+	// keyMu guards jwtKey reads (the requireAuth hot path) against rotation.
+	keyMu sync.RWMutex
+	// keyDir holds jwt.key (next to the executable); empty in tests disables rotation.
+	keyDir string
+	// loginLim throttles failed attempts on the unauthenticated /api/auth/*
+	// endpoints per source IP. nil (tests) = off.
+	loginLim *loginLimiter
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -145,7 +152,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, keyDir: keyDir, loginLim: newLoginLimiter(), chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -874,6 +881,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
 	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
 	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
+	mux.HandleFunc("GET /api/sync/fofa/config", s.fofaConfigGet)
+	mux.HandleFunc("POST /api/sync/fofa/config", s.fofaConfigSet)
+	mux.HandleFunc("GET /api/sync/fofa/quota", s.fofaQuota)
+	mux.HandleFunc("POST /api/sync/fofa/preview", s.fofaPreview)
+	mux.HandleFunc("POST /api/sync/fofa/import", s.fofaImport)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)

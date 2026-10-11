@@ -43,12 +43,323 @@ export default function AssetSyncPage() {
       <Tabs defaultValue="scopesentry">
         <TabsList>
           <TabsTrigger value="scopesentry">ScopeSentry</TabsTrigger>
+          <TabsTrigger value="fofa">FOFA</TabsTrigger>
         </TabsList>
         <TabsContent value="scopesentry" className="mt-4">
           <ScopeSentryPanel />
         </TabsContent>
+        <TabsContent value="fofa" className="mt-4">
+          <FofaPanel />
+        </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+// ── FOFA 面板 ────────────────────────────────────────────────────────────────
+
+type FofaConfig = Awaited<ReturnType<typeof api.fofaConfig>>;
+type FofaPresetOption = { id: string; label: string; base_url: string; email: boolean };
+
+function FofaPanel() {
+  const [cfg, setCfg] = React.useState<FofaConfig | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    api
+      .fofaConfig()
+      .then(setCfg)
+      .catch((e) => toast.error(`读取 FOFA 配置失败：${e.message}`))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="space-y-4">
+      <FofaConfigCard cfg={cfg} loading={loading} onChanged={load} />
+      {cfg?.valid ? <FofaWorkbench /> : (
+        <Card>
+          <CardContent className="py-8 text-center text-muted-foreground text-sm">
+            配置端点与 Key 后即可按 FOFA 查询语句导入资产（全程被动，不向目标发送流量）。
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function FofaConfigCard({ cfg, loading, onChanged }: { cfg: FofaConfig | null; loading: boolean; onChanged: () => void }) {
+  const [endpoint, setEndpoint] = React.useState("official");
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [email, setEmail] = React.useState("");
+  const [apiKey, setApiKey] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [quota, setQuota] = React.useState<string | null>(null);
+
+  const presets: FofaPresetOption[] = cfg?.presets ?? [];
+  const current = presets.find((p) => p.id === endpoint);
+  const needEmail = !!current?.email;
+
+  React.useEffect(() => {
+    if (!cfg) return;
+    setEndpoint(cfg.endpoint || "official");
+    setBaseUrl(cfg.base_url || "");
+    setEmail(cfg.email || "");
+  }, [cfg]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await api.fofaSaveConfig({
+        endpoint,
+        base_url: endpoint === "custom" ? baseUrl.trim() : undefined,
+        email: needEmail ? email.trim() : undefined,
+        api_key: apiKey.trim() || undefined,
+      });
+      toast.success(r.valid ? "已保存并生效" : "已保存（配置尚不完整）");
+      setApiKey("");
+      setQuota(null);
+      onChanged();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const checkQuota = async () => {
+    setBusy(true);
+    setQuota(null);
+    try {
+      const r = await api.fofaQuota();
+      const row = r.info?.[0] ?? [];
+      setQuota(
+        row.length > 0
+          ? row.map((v, i) => (typeof v === "object" ? JSON.stringify(v) : String(v))).join("  |  ")
+          : JSON.stringify(r.info),
+      );
+    } catch (e) {
+      toast.error(`查询余额失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <PlugZapIcon className="size-4" /> FOFA 数据源
+          {loading ? (
+            <Badge variant="secondary">检测中…</Badge>
+          ) : cfg?.valid ? (
+            <Badge className="bg-emerald-600 hover:bg-emerald-600">
+              <CheckCircle2Icon className="mr-1 size-3" /> 已配置
+            </Badge>
+          ) : (
+            <Badge variant="outline">未配置</Badge>
+          )}
+        </CardTitle>
+        <Button variant="ghost" size="sm" onClick={onChanged} disabled={loading}>
+          <RefreshCwIcon className={loading ? "size-4 animate-spin" : "size-4"} /> 刷新
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>接口端点</Label>
+            <select
+              className="border-input bg-background h-9 w-full rounded-md border px-3 text-sm"
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+            >
+              {(presets.length ? presets : [{ id: "official", label: "官方 fofa.info", base_url: "", email: true }]).map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          {endpoint === "custom" && (
+            <div className="space-y-1.5">
+              <Label>Base URL（官方兼容代理地址）</Label>
+              <Input placeholder="https://your-proxy.example.com" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+            </div>
+          )}
+          {needEmail && (
+            <div className="space-y-1.5">
+              <Label>账号 Email（官方接口需要）</Label>
+              <Input placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+            </div>
+          )}
+          <div className="space-y-1.5">
+            <Label>API Key（留空保留原值{cfg?.key_set ? "，已设置" : ""}）</Label>
+            <Input type="password" placeholder="FOFA Key" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={save} disabled={busy}>
+            保存配置
+          </Button>
+          <Button variant="outline" onClick={checkQuota} disabled={busy || !cfg?.valid}>
+            查询余额（免费）
+          </Button>
+          {quota && <span className="text-muted-foreground font-mono text-xs">{quota}</span>}
+        </div>
+        <p className="text-muted-foreground text-xs">
+          查询走 FOFA 历史索引，全程不向目标发送流量。第三方代理按「1 次查询 + 返回条数」计费，预览（size=1）几乎不耗条数。
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function FofaWorkbench() {
+  const [query, setQuery] = React.useState(`domain="example.com"`);
+  const [size, setSize] = React.useState(1000);
+  const [companyName, setCompanyName] = React.useState("");
+  const [createCompany, setCreateCompany] = React.useState(true);
+  const [preview, setPreview] = React.useState<{ match_size: number; sample: unknown[][] } | null>(null);
+  const [busy, setBusy] = React.useState<"none" | "preview" | "import">("none");
+  const [result, setResult] = React.useState<Awaited<ReturnType<typeof api.fofaImport>> | null>(null);
+
+  const doPreview = async () => {
+    if (!query.trim()) return toast.error("请填写 FOFA 查询语句");
+    setBusy("preview");
+    setPreview(null);
+    try {
+      const r = await api.fofaPreview(query.trim());
+      setPreview(r);
+      const m = query.match(/domain="([^"]+)"/);
+      if (m && !companyName) setCompanyName(m[1]);
+      toast.success(`命中 ${r.match_size} 条`);
+    } catch (e) {
+      toast.error(`预览失败：${(e as Error).message}`);
+    } finally {
+      setBusy("none");
+    }
+  };
+
+  const doImport = async () => {
+    if (!query.trim()) return toast.error("请填写 FOFA 查询语句");
+    setBusy("import");
+    setResult(null);
+    try {
+      const r = await api.fofaImport({
+        query: query.trim(),
+        size,
+        company_name: companyName.trim() || undefined,
+        create_company: createCompany,
+      });
+      setResult(r);
+      toast.success(`导入完成：${r.synced?.ip ?? 0} 个 IP / ${r.synced?.port ?? 0} 个端口`);
+    } catch (e) {
+      toast.error(`导入失败：${(e as Error).message}`);
+    } finally {
+      setBusy("none");
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">FOFA 查询导入</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+          <div className="space-y-1.5">
+            <Label>FOFA 查询语句</Label>
+            <Input
+              placeholder={'domain="example.com"'}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && doPreview()}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label>条数上限</Label>
+            <select
+              className="border-input bg-background h-9 w-32 rounded-md border px-3 text-sm"
+              value={size}
+              onChange={(e) => setSize(Number(e.target.value))}
+            >
+              {[100, 500, 1000, 5000, 10000].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>归属企业（空 = 从 domain 提取）</Label>
+            <Input placeholder="如：乐天集团" value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+          </div>
+          <div className="flex items-end gap-2 pb-0.5">
+            <label htmlFor="fofa-create-company" className="flex items-center gap-1.5 text-sm">
+              <Checkbox
+                id="fofa-create-company"
+                checked={createCompany}
+                onCheckedChange={(c) => setCreateCompany(!!c)}
+              />
+              企业不存在时创建并写入资产范围
+            </label>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={doPreview} disabled={busy !== "none"}>
+            <SearchIcon className={busy === "preview" ? "size-4 animate-pulse" : "size-4"} /> 预览命中（几乎不耗配额）
+          </Button>
+          <Button onClick={doImport} disabled={busy !== "none"}>
+            <DownloadIcon className={busy === "import" ? "size-4 animate-pulse" : "size-4"} /> 导入资产
+          </Button>
+        </div>
+        {preview && (
+          <div className="space-y-2 rounded-md border bg-muted/40 p-3 text-sm">
+            <p>
+              命中总数 <b>{preview.match_size}</b> 条
+              {preview.match_size > size && <span className="text-amber-600 dark:text-amber-500">（超过条数上限，导入将截断前 {size} 条）</span>}
+            </p>
+            {preview.sample?.length > 0 && (
+              <pre className="text-muted-foreground overflow-x-auto font-mono text-xs">
+                {JSON.stringify(preview.sample[0])}
+              </pre>
+            )}
+          </div>
+        )}
+        {result && (
+          <div className="space-y-2 rounded-md border bg-muted/40 p-3 text-sm">
+            <div className="flex flex-wrap gap-3">
+              {Object.entries(result.synced ?? {}).map(([k, v]) => (
+                <Badge key={k} variant="secondary">
+                  {k === "ip" ? "IP" : k === "port" ? "端口" : k}: {v}
+                </Badge>
+              ))}
+            </div>
+            {result.companies && result.companies.length > 0 && (
+              <p className="text-muted-foreground">新建/更新企业：{result.companies.join("、")}</p>
+            )}
+            {result.warnings?.map((wm) => (
+              <p key={wm} className="text-muted-foreground text-xs">
+                {wm}
+              </p>
+            ))}
+            {result.errors && result.errors.length > 0 && (
+              <ul className="list-inside list-disc text-destructive">
+                {result.errors.slice(0, 10).map((em) => (
+                  <li key={em}>{em}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
