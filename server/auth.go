@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -68,6 +70,19 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
 		return []byte(strings.TrimSpace(string(data))), nil
 	}
+	buf, err := generateJWTKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		return nil, fmt.Errorf("write jwt key: %w", err)
+	}
+	log.Printf("[auth] 新 JWT key 已写入 %s", path)
+	return buf, nil
+}
+
+// generateJWTKey produces a fresh 32-char random signing key.
+func generateJWTKey() ([]byte, error) {
 	buf := make([]byte, 32)
 	for i := range buf {
 		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))
@@ -76,11 +91,158 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 		}
 		buf[i] = keyChars[n.Int64()]
 	}
-	if err := os.WriteFile(path, buf, 0600); err != nil {
-		return nil, fmt.Errorf("write jwt key: %w", err)
-	}
-	log.Printf("[auth] 新 JWT key 已写入 %s", path)
 	return buf, nil
+}
+
+// rotateJWTKey replaces the JWT signing key in memory and on disk (tmp+rename,
+// atomic). Every token signed with the old key — including any token stolen
+// before the password change — stops validating immediately. Returns the new
+// key so the caller can mint a fresh token for the operator who just proved
+// knowledge of the new password. keyDir empty (tests) → error, no rotation.
+func (s *Server) rotateJWTKey() ([]byte, error) {
+	if s.keyDir == "" {
+		return nil, fmt.Errorf("jwt key directory not configured")
+	}
+	key, err := generateJWTKey()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(s.keyDir, jwtKeyFilename)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, key, 0o600); err != nil {
+		return nil, fmt.Errorf("write rotated jwt key: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("install rotated jwt key: %w", err)
+	}
+	s.keyMu.Lock()
+	s.jwtKey = key
+	s.keyMu.Unlock()
+	return key, nil
+}
+
+// jwtKeyBytes snapshots the signing key under the read lock (rotation swaps it).
+func (s *Server) jwtKeyBytes() []byte {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	return s.jwtKey
+}
+
+// ---------- login rate limiting ----------
+//
+// loginLimiter throttles password guessing on the unauthenticated auth
+// endpoints: per source IP, loginMaxFails attempts inside loginWindow lock the
+// IP out for loginLockout. A successful login clears the counter, so only
+// failures accumulate. Entries are swept lazily so the map stays bounded.
+
+const (
+	loginMaxFails = 5
+	loginWindow   = 15 * time.Minute
+	loginLockout  = 15 * time.Minute
+	loginSweepCap = 4096
+)
+
+type loginLimiter struct {
+	mu      sync.Mutex
+	entries map[string]*loginEntry
+}
+
+type loginEntry struct {
+	fails       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{entries: map[string]*loginEntry{}}
+}
+
+// allow reports whether an attempt from ip may proceed right now.
+func (l *loginLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if len(l.entries) > loginSweepCap {
+		for k, e := range l.entries {
+			if now.After(e.lockedUntil) && now.Sub(e.windowStart) > loginWindow {
+				delete(l.entries, k)
+			}
+		}
+	}
+	e := l.entries[ip]
+	if e == nil {
+		return true
+	}
+	if now.Before(e.lockedUntil) {
+		return false
+	}
+	if now.Sub(e.windowStart) > loginWindow {
+		delete(l.entries, ip)
+		return true
+	}
+	return e.fails < loginMaxFails
+}
+
+// fail records a failed attempt, starting or incrementing the window and
+// locking the IP once the cap is reached.
+func (l *loginLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	e := l.entries[ip]
+	if e == nil || now.Sub(e.windowStart) > loginWindow {
+		e = &loginEntry{windowStart: now}
+		l.entries[ip] = e
+	}
+	e.fails++
+	if e.fails >= loginMaxFails {
+		e.lockedUntil = now.Add(loginLockout)
+	}
+}
+
+// success clears the IP's counter after a successful login.
+func (l *loginLimiter) success(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, ip)
+}
+
+// clientIP extracts the remote host from RemoteAddr. No reverse proxy sits in
+// front of the API in the supported deployment, so this is the real client.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginGate blocks the request when its source IP is locked out. Nil-tolerant:
+// tests construct Server without a limiter.
+func (s *Server) loginGate(w http.ResponseWriter, r *http.Request) bool {
+	if s.loginLim == nil {
+		return true
+	}
+	if !s.loginLim.allow(clientIP(r)) {
+		writeErr(w, 429, "失败次数过多，IP 已临时锁定，请 15 分钟后再试")
+		return false
+	}
+	return true
+}
+
+// loginFail records a failed attempt (nil-tolerant, see loginGate).
+func (s *Server) loginFail(r *http.Request) {
+	if s.loginLim != nil {
+		s.loginLim.fail(clientIP(r))
+	}
+}
+
+// loginSuccess clears the attempt counter (nil-tolerant, see loginGate).
+func (s *Server) loginSuccess(r *http.Request) {
+	if s.loginLim != nil {
+		s.loginLim.success(clientIP(r))
+	}
 }
 
 // signJWT issues a 7-day HS256 token for user ARTEX.
@@ -129,7 +291,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWT(tok, s.jwtKeyBytes()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -155,7 +317,12 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
+// Gated by the login limiter: uninitialized installs burn bcrypt on every call,
+// so the pre-auth window is throttle-protected too.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
+	if !s.loginGate(w, r) {
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -169,6 +336,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	s.loginFail(r) // count before the bcrypt path; success clears below
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -197,7 +365,8 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	s.loginSuccess(r)
+	tok, err := signJWT(s.jwtKeyBytes())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
@@ -207,13 +376,16 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/change-password — changes the admin password. Requires a valid
 // token (this route is under /api/auth/* which requireAuth exempts, so the token
-// is validated here) AND the current password.
+// is validated here) AND the current password. On success the JWT signing key is
+// ROTATED: every token issued before the change — including any that leaked —
+// becomes invalid immediately, and the response carries a fresh token so the
+// operator making the change stays logged in.
 func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKeyBytes()) {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,11 +427,29 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	key, rerr := s.rotateJWTKey()
+	if rerr != nil {
+		// 密码已更新；轮换失败时旧 token 在其有效期内仍可用——如实告知日志，
+		// 下次重启（或再次改密）会以磁盘上的密钥为准。
+		log.Printf("[auth] 密码已更新，但 JWT key 轮换失败（旧 token 仍有效）: %v", rerr)
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	tok, err := signJWT(key)
+	if err != nil {
+		writeErr(w, 500, "token 生成失败")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
+// Per-IP failure throttled: loginMaxFails failures in loginWindow lock the
+// source IP for loginLockout (429). A successful login clears the counter.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.loginGate(w, r) {
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -273,6 +463,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username != "ARTEX" {
+		s.loginFail(r)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
@@ -286,10 +477,12 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		s.loginFail(r)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	s.loginSuccess(r)
+	tok, err := signJWT(s.jwtKeyBytes())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
