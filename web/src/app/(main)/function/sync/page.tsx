@@ -136,12 +136,17 @@ function FofaConfigCard({ cfg, loading, onChanged }: { cfg: FofaConfig | null; l
     setQuota(null);
     try {
       const r = await api.fofaQuota();
-      const row = r.info?.[0] ?? [];
-      setQuota(
-        row.length > 0
-          ? row.map((v, i) => (typeof v === "object" ? JSON.stringify(v) : String(v))).join("  |  ")
-          : JSON.stringify(r.info),
-      );
+      const info = r.info;
+      if (!info || info.error === true) {
+        setQuota(info?.message ? String(info.message) : "接口返回异常");
+        return;
+      }
+      const parts: string[] = [];
+      if (info.remain_api_query != null) parts.push(`今日剩余查询 ${info.remain_api_query} 次`);
+      if (info.remain_api_data != null) parts.push(`剩余条数 ${info.remain_api_data}`);
+      if (info.expiration) parts.push(`到期 ${info.expiration}`);
+      if (info.username) parts.push(`${info.username}${info.isvip ? ` (VIP${info.vip_level ?? ""})` : ""}`);
+      setQuota(parts.length > 0 ? parts.join("  ·  ") : JSON.stringify(info));
     } catch (e) {
       toast.error(`查询余额失败：${(e as Error).message}`);
     } finally {

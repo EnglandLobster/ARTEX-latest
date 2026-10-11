@@ -1149,7 +1149,7 @@ export const api = {
     }>("/sync/fofa/config"),
   fofaSaveConfig: (body: { endpoint: string; base_url?: string; email?: string; api_key?: string }) =>
     post<{ ok: boolean; valid: boolean }>("/sync/fofa/config", body),
-  fofaQuota: () => get<{ info: unknown[][] }>("/sync/fofa/quota"),
+  fofaQuota: () => get<{ info: Record<string, unknown> | null }>("/sync/fofa/quota"),
   fofaPreview: (query: string) =>
     post<{ match_size: number; sample: unknown[][] }>("/sync/fofa/preview", { query }),
   fofaImport: (body: { query: string; size?: number; company_name?: string; create_company?: boolean }) =>
