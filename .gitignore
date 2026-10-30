@@ -59,4 +59,4 @@ Thumbs.db
 /Dockerfile.bench
 /Dockerfile.bench.v2
 # local server backup dirs
-artex.bak-*/
+artex.bak-*
