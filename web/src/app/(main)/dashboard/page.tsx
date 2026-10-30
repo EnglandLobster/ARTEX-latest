@@ -815,7 +815,7 @@ export default function DashboardPage() {
                     tickLine={false}
                     axisLine={false}
                     tick={{ fontSize: 10 }}
-                    width={44}
+                    width="auto"
                   />
                   <ChartTooltip
                     cursor={false}
