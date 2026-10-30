@@ -66,13 +66,28 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ## 安装
 
+### CLI 与 Agent Skill（独立仓库）
+
+配套的零依赖管理 CLI（`artexctl`）与 Agent Skill 在独立仓库 [EnglandLobster/artex-cli](https://github.com/EnglandLobster/artex-cli) 维护。
+
+支持本机、HTTPS 与 SSH 远程调用，覆盖任务、会话、资产、漏洞/复测、审批、流量、证据导出及平台配置。独立 Python 客户端不依赖 Go/Node，不替换现有后端。
+
+```bash
+git clone https://github.com/EnglandLobster/artex-cli.git
+cd artex-cli
+python3 cli/install.py              # 本机安装
+python3 cli/install.py --ssh myvps  # 安装到远端服务器（任意 SSH 别名）
+```
+
+详见该仓库的 [CLI 安装与用法](https://github.com/EnglandLobster/artex-cli/blob/main/cli/README.md) 与 [配套 Agent Skill](https://github.com/EnglandLobster/artex-cli/blob/main/cli/skill/artex/SKILL.md)。
+
 > 依赖数据库 **PostgreSQL**；探索需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
 
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
+git clone https://github.com/EnglandLobster/ARTEX-latest.git
+cd ARTEX-latest
 ./install.sh
 ```
 
