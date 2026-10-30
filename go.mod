@@ -1,6 +1,7 @@
 module github.com/Autumn-27/artex
 
 go 1.26.3
+replace github.com/Autumn-27/norma => ./norma
 
 require (
 	github.com/Autumn-27/norma v0.4.3
